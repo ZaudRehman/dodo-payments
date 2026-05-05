@@ -1,0 +1,79 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE payment_attempts\n           SET status = $1, psp_ref = $2, failure_code = $3, updated_at = NOW()\n           WHERE id = $4\n           RETURNING id, invoice_id, idempotency_key, card_token, status,\n                     psp_ref, failure_code, request_hash, created_at, updated_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "invoice_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "idempotency_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "card_token",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "psp_ref",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "failure_code",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "request_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "bcd13dcf0dd2da3868bcb394aac58d584e29aeeb248ef2887b0de7105c839c18"
+}

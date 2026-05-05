@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE webhook_deliveries\n                   SET attempts = $1, last_error = $2,\n                       next_attempt_at = NOW() + ($3 || ' seconds')::interval\n                   WHERE id = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "92b86de0df3af426d9dfb4cedb203a4b1078b463ff0ec0573b0f94c21ee9e574"
+}

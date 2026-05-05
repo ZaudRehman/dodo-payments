@@ -131,8 +131,7 @@ async fn deliver_webhook(
     if success {
         tracing::info!(delivery_id = %delivery_id, url = %url, "Webhook delivered successfully");
         let _ = sqlx::query!(
-            "UPDATE webhook_deliveries SET status = 'delivered', attempts = $1, updated_at = NOW() WHERE id = $2",
-            // We need updated_at column — let's use last_error as a log
+            "UPDATE webhook_deliveries SET status = 'delivered', attempts = $1 WHERE id = $2",
             new_attempts,
             delivery_id
         )

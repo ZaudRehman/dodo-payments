@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: dodo
+      POSTGRES_USER: dodo
+      POSTGRES_PASSWORD: secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dodo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mock_psp:
+    build:
+      context: .
+      dockerfile: mock_psp/Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      RUST_LOG: info
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://dodo:secret@db:5432/dodo
+      PSP_BASE_URL: http://mock_psp:3001
+      RUST_LOG: info
+    depends_on:
+      db:
+        condition: service_healthy
+      mock_psp:
+        condition: service_started
+
+volumes:
+  pgdata:

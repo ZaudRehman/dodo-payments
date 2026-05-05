@@ -1,0 +1,362 @@
+openapi: 3.0.3
+info:
+  title: Dodo Payments — Invoice & Payment Service
+  version: 1.0.0
+  description: |
+    Invoice & Payment Service API.
+    All protected endpoints require `Authorization: Bearer <api_key>`.
+
+servers:
+  - url: http://localhost:3000
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: invalid_state_transition
+            message:
+              type: string
+              example: Cannot transition invoice from 'paid' state with action 'pay'
+
+    Customer:
+      type: object
+      properties:
+        id:         { type: string, format: uuid }
+        business_id:{ type: string, format: uuid }
+        name:       { type: string }
+        email:      { type: string, format: email }
+        created_at: { type: string, format: date-time }
+
+    LineItem:
+      type: object
+      properties:
+        id:                  { type: string, format: uuid }
+        invoice_id:          { type: string, format: uuid }
+        description:         { type: string }
+        quantity:            { type: integer, minimum: 1 }
+        unit_amount_cents:   { type: integer, minimum: 0, description: "Integer cents — no floats" }
+        amount_cents:        { type: integer, minimum: 0, description: "quantity * unit_amount_cents, server-computed" }
+
+    Invoice:
+      type: object
+      properties:
+        id:           { type: string, format: uuid }
+        business_id:  { type: string, format: uuid }
+        customer_id:  { type: string, format: uuid }
+        status:
+          type: string
+          enum: [draft, open, paid, void, uncollectible]
+        total_cents:  { type: integer, description: "Server-computed total in cents" }
+        due_date:     { type: string, format: date }
+        created_at:   { type: string, format: date-time }
+        updated_at:   { type: string, format: date-time }
+
+    InvoiceResponse:
+      type: object
+      properties:
+        invoice:    { $ref: '#/components/schemas/Invoice' }
+        line_items:
+          type: array
+          items: { $ref: '#/components/schemas/LineItem' }
+
+    PaymentAttempt:
+      type: object
+      properties:
+        id:               { type: string, format: uuid }
+        invoice_id:       { type: string, format: uuid }
+        idempotency_key:  { type: string }
+        card_token:       { type: string }
+        status:
+          type: string
+          enum: [pending, succeeded, failed]
+        psp_ref:          { type: string, nullable: true }
+        failure_code:     { type: string, nullable: true, example: card_declined }
+        created_at:       { type: string, format: date-time }
+        updated_at:       { type: string, format: date-time }
+
+    WebhookEndpoint:
+      type: object
+      properties:
+        id:          { type: string, format: uuid }
+        business_id: { type: string, format: uuid }
+        url:         { type: string, format: uri }
+        active:      { type: boolean }
+        created_at:  { type: string, format: date-time }
+
+security:
+  - BearerAuth: []
+
+paths:
+  /admin/businesses:
+    post:
+      summary: Create a business and get an API key
+      security: []
+      tags: [Admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        '200':
+          description: Business created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  business_id: { type: string, format: uuid }
+                  api_key:     { type: string, description: "Raw key — only shown once" }
+                  key_prefix:  { type: string }
+
+  /customers:
+    post:
+      summary: Create a customer
+      tags: [Customers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email]
+              properties:
+                name:  { type: string }
+                email: { type: string, format: email }
+      responses:
+        '200':
+          description: Customer created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Customer' }
+        '400': { description: Validation error }
+        '401': { description: Unauthorized }
+
+    get:
+      summary: List customers
+      tags: [Customers]
+      responses:
+        '200':
+          description: List of customers
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Customer' }
+
+  /customers/{id}:
+    get:
+      summary: Get a customer by ID
+      tags: [Customers]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Customer' }
+        '404': { description: Not found }
+
+  /invoices:
+    post:
+      summary: Create an invoice
+      tags: [Invoices]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customer_id, due_date, line_items]
+              properties:
+                customer_id: { type: string, format: uuid }
+                due_date:    { type: string, format: date }
+                line_items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [description, quantity, unit_amount_cents]
+                    properties:
+                      description:       { type: string }
+                      quantity:          { type: integer, minimum: 1 }
+                      unit_amount_cents: { type: integer, minimum: 0 }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InvoiceResponse' }
+
+    get:
+      summary: List invoices
+      tags: [Invoices]
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [draft, open, paid, void, uncollectible]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Invoice' }
+
+  /invoices/{id}:
+    get:
+      summary: Get an invoice by ID
+      tags: [Invoices]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InvoiceResponse' }
+
+  /invoices/{id}/void:
+    post:
+      summary: Void an invoice
+      tags: [Invoices]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invoice' }
+        '409': { description: Invalid state transition }
+
+  /invoices/{id}/pay:
+    post:
+      summary: Attempt to pay an invoice
+      tags: [Payments]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [card_token]
+              properties:
+                card_token:
+                  type: string
+                  enum: [tok_success, tok_insufficient_funds, tok_card_declined, tok_timeout, tok_network_error]
+      responses:
+        '200':
+          description: Payment attempt result (check status field)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentAttempt' }
+        '409': { description: Invalid state (invoice already paid/voided) }
+        '422': { description: Idempotency key conflict }
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: { type: string }
+          description: Unique key for this payment attempt. Retrying with the same key returns the same result.
+
+  /invoices/{id}/payment-attempts:
+    get:
+      summary: List payment attempts for an invoice
+      tags: [Payments]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PaymentAttempt' }
+
+  /webhooks:
+    post:
+      summary: Register a webhook endpoint
+      tags: [Webhooks]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpoint' }
+
+    get:
+      summary: List webhook endpoints
+      tags: [Webhooks]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/WebhookEndpoint' }
+
+  /webhooks/{id}:
+    delete:
+      summary: Delete a webhook endpoint
+      tags: [Webhooks]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Deleted }
+
+  /webhook-deliveries:
+    get:
+      summary: List webhook deliveries (for reconciliation)
+      tags: [Webhooks]
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, delivered, failed]
+      responses:
+        '200':
+          description: Webhook delivery log

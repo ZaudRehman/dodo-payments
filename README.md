@@ -4,7 +4,8 @@ A minimal Invoice & Payment Service built in Rust (Axum + PostgreSQL).
 
 ## Demo Video
 
-> 📹 **[PASTE LOOM LINK HERE]**
+> 📹 Part 1: **https://www.loom.com/share/dec8b2f4dfe84aadb889477375a50c39**
+> 📹 Part 2: **https://www.loom.com/share/23935f5e21bf4d07b7f058b1c9bcff7d**
 >
 > Covers: architecture overview, live demo (create customer → invoice → payment), state machine walkthrough, and PSP failure mode walkthrough.
 

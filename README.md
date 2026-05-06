@@ -5,6 +5,8 @@ A minimal Invoice & Payment Service built in Rust (Axum + PostgreSQL).
 ## Demo Video
 
 > 📹 **[PASTE LOOM LINK HERE]**
+>
+> Covers: architecture overview, live demo (create customer → invoice → payment), state machine walkthrough, and PSP failure mode walkthrough.
 
 ---
 
@@ -32,7 +34,7 @@ docker compose up --build
 # The mock PSP is on http://localhost:3001
 ```
 
-No manual steps required. Migrations run automatically on startup.
+No manual steps required. Migrations run automatically on startup via `sqlx::migrate!()` in `main.rs`.
 
 ---
 
@@ -116,10 +118,24 @@ Expected: `status: "succeeded"`, invoice transitions to `paid`.
 
 ### 4. Failed Payment (Card Declined)
 
-```bash
-# Create a fresh invoice first (paid invoices cannot be paid again)
-export INVOICE_ID2="<new invoice id>"
+Create a second invoice (a paid invoice cannot be paid again):
 
+```bash
+export INVOICE_ID2=$(curl -s -X POST http://localhost:3000/invoices \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"customer_id\": \"$CUSTOMER_ID\",
+    \"due_date\": \"2026-12-31\",
+    \"line_items\": [
+      { \"description\": \"Consulting\", \"quantity\": 2, \"unit_amount_cents\": 5000 }
+    ]
+  }" | jq -r '.id')
+```
+
+Then attempt payment with a declined card:
+
+```bash
 curl -s -X POST http://localhost:3000/invoices/$INVOICE_ID2/pay \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
@@ -143,23 +159,34 @@ curl -s -X POST http://localhost:3000/webhooks \
 ## Tests
 
 ```bash
-# Run integration tests (requires a running PostgreSQL)
+# Ensure the database is running
+docker compose up -d db
+sleep 3
+
+# Run migrations
+DATABASE_URL=postgres://dodo:secret@localhost:5432/dodo sqlx migrate run
+
+# Generate sqlx offline cache (only needed once, or after schema changes)
+DATABASE_URL=postgres://dodo:secret@localhost:5432/dodo cargo sqlx prepare --workspace -- --all-targets
+
+# Run integration tests
 DATABASE_URL=postgres://dodo:secret@localhost:5432/dodo cargo test -- --test-threads=1
 ```
 
 The three required tests cover:
-1. **Concurrency** — N concurrent `POST /pay` → exactly 1 succeeds
-2. **Idempotency** — same key retry → same result, no duplicate attempt
-3. **PSP failure** — `tok_timeout` → invoice stays `open`, not corrupted
+
+1. **Concurrency** — N concurrent `POST /pay` → exactly 1 succeeds, no double-charge
+2. **Idempotency** — same key retry → same result, no duplicate attempt inserted
+3. **PSP failure** — `tok_timeout` → invoice stays `open`, attempt marked `failed`, state not corrupted
 
 ---
 
 ## Project Structure
 
-```
+```text
 dodo-payments/
 ├── src/
-│   ├── main.rs              # App entry point, router setup
+│   ├── main.rs              # App entry point, router setup, auto-migration
 │   ├── errors.rs            # Unified AppError → consistent JSON responses
 │   ├── webhook.rs           # Background delivery worker
 │   ├── middleware/auth.rs   # Bearer API key authentication

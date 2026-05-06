@@ -1,5 +1,9 @@
 # DESIGN.md — Invoice & Payment Service
 
+I wrote this to explain the decisions behind the service, mainly around payment correctness, idempotency, and webhooks. I kept it aligned with what the code actually does and called out the places where I deliberately kept things smaller than a production system.
+
+***
+
 ## 1. Data Model
 
 ### Tables
@@ -16,23 +20,23 @@
 |--------|------|-------|
 | id | UUID PK | |
 | business_id | UUID FK | Scoped to one business |
-| key_hash | TEXT UNIQUE | SHA-256 of raw key — plaintext never stored |
-| key_prefix | TEXT | First 9 chars (e.g. `dodo_ab12`) for display |
+| key_hash | TEXT UNIQUE | SHA-256 of raw key, plaintext never stored |
+| key_prefix | TEXT | First 9 chars (for example `dodo_ab12`) for display only |
 | created_at | TIMESTAMPTZ | |
-| revoked_at | TIMESTAMPTZ NULL | NULL = active |
+| revoked_at | TIMESTAMPTZ NULL | NULL means active |
 
-Index: `api_keys(key_hash)` — every authenticated request hashes the Bearer token and hits this index.
+Index: `api_keys(key_hash)`. Every authenticated request hashes the Bearer token and hits this index. Fast lookup, no plaintext stored.
 
 **customers**
 | Column | Type | Notes |
 |--------|------|-------|
 | id | UUID PK | |
-| business_id | UUID FK | Scoped — a customer belongs to one business |
+| business_id | UUID FK | A customer belongs to one business |
 | name | TEXT | |
 | email | TEXT | |
 | created_at | TIMESTAMPTZ | |
 
-Unique constraint: `(business_id, email)` — prevents duplicate customers per business.
+Unique constraint on `(business_id, email)`. Two businesses can share a customer email. Within the same business, duplicates are rejected.
 
 **invoices**
 | Column | Type | Notes |
@@ -40,12 +44,12 @@ Unique constraint: `(business_id, email)` — prevents duplicate customers per b
 | id | UUID PK | |
 | business_id | UUID FK | |
 | customer_id | UUID FK | |
-| status | TEXT | `draft`, `open`, `paid`, `void`, `uncollectible` |
-| total_cents | BIGINT | Integer cents — **no floats anywhere** |
+| status | TEXT | `open`, `paid`, `void`, `uncollectible` |
+| total_cents | BIGINT | Integer cents, no floats anywhere |
 | due_date | DATE | |
 | created_at / updated_at | TIMESTAMPTZ | |
 
-Indexes: `invoices(business_id)`, `invoices(status)`, `invoices(customer_id)`.
+Indexes on `invoices(business_id)`, `invoices(status)`, and `invoices(customer_id)`. The status index matters for list-by-state queries. Without it, filtering open invoices across a large business is a full scan.
 
 **line_items**
 | Column | Type | Notes |
@@ -55,163 +59,193 @@ Indexes: `invoices(business_id)`, `invoices(status)`, `invoices(customer_id)`.
 | description | TEXT | |
 | quantity | INTEGER | CHECK > 0 |
 | unit_amount_cents | BIGINT | CHECK >= 0 |
-| amount_cents | BIGINT | `quantity * unit_amount_cents` — server computed |
+| amount_cents | BIGINT | `quantity * unit_amount_cents`, server-computed |
 
-The server always computes `amount_cents` and `total_cents`. Client-supplied totals are ignored.
+The server always computes `amount_cents` and `total_cents`. Any client-supplied total is ignored. Trusting the client to do money math is the kind of bug that causes real financial damage.
 
 **payment_attempts**
 | Column | Type | Notes |
 |--------|------|-------|
 | id | UUID PK | |
 | invoice_id | UUID FK | |
-| idempotency_key | TEXT UNIQUE | Prevents duplicate processing |
-| request_hash | TEXT | SHA-256 of request body — detects body mismatch on key reuse |
+| idempotency_key | TEXT UNIQUE | Deduplication key |
+| request_hash | TEXT | SHA-256 of request body, detects key reuse with a different body |
 | card_token | TEXT | |
 | status | TEXT | `pending`, `succeeded`, `failed` |
-| psp_ref | TEXT NULL | PSP-assigned reference on success |
-| failure_code | TEXT NULL | e.g. `card_declined`, `psp_timeout` |
+| psp_ref | TEXT NULL | PSP reference on success |
+| failure_code | TEXT NULL | For example `card_declined`, `psp_timeout` |
 | created_at / updated_at | TIMESTAMPTZ | |
 
-**webhook_endpoints** and **webhook_deliveries** — see Section 4.
+The `idempotency_key` unique index is hit on every pay request. The `request_hash` exists for one reason: if a caller reuses the same key with a different request body, that is a caller bug and should be rejected, not silently processed.
+
+**webhook_endpoints** and **webhook_deliveries** are covered in Section 4.
 
 ### Why UUIDs?
 
-UUIDs as PKs prevent enumeration attacks (an attacker cannot guess sequential IDs to probe other businesses' data). The performance trade-off vs. integer PKs is acceptable at this scale.
+UUIDs as primary keys prevent enumeration. With sequential integers, an attacker who knows invoice `1001` exists can probe `1002`, `1003`, and so on. UUIDs remove that.
+
+The downside is slightly worse index locality compared to integers. At this scale that is an acceptable trade-off, and most hot queries filter by `business_id` anyway.
 
 ### At 100x Scale
 
-- Partition `invoices` and `payment_attempts` by `business_id` (range or hash).
-- Add read replicas; route `GET` queries to replicas.
-- Move `webhook_deliveries` processing to a dedicated queue (SQS, NATS) instead of polling the DB.
-- Consider sharding `api_keys` by hash prefix for sub-millisecond auth lookups.
+- Partition `invoices` and `payment_attempts` by `business_id`. Most queries are already scoped to one business, so partition pruning would give a lot back.
+- Add read replicas. Route all `GET` queries there and keep writes on primary.
+- Replace the DB polling webhook worker with a proper queue (SQS, NATS, or Postgres LISTEN/NOTIFY). Polling every 5 seconds works fine at low volume but does not scale cleanly.
+- Move API key lookup to Redis if auth latency becomes a hot path, to avoid a DB round-trip on every request.
 
----
+***
 
 ## 2. Invoice State Machine
 
+```text
+  [CREATE INVOICE]
+         |
+         v
+       open
+         |
+         |-- POST /pay, PSP succeeds -------> paid          [TERMINAL]
+         |
+         |-- POST /void --------------------> void          [TERMINAL]
+         |
+         +-- manual mark ------------------> uncollectible  [TERMINAL]
 ```
-         ┌─────────────────────────────────────────────┐
-         │                                             │
-  [CREATE]│                                             │
-         ▼                                             │
-       draft ──(finalize / first pay attempt)──► open  │
-                                                  │    │
-                               ┌──────────────────┘    │
-                               │                       │
-                    ┌──────────▼──────────┐            │
-                    │ POST /pay called     │            │
-                    │ PSP succeeds         │            │
-                    └──────────┬──────────┘            │
-                               │                       │
-                               ▼                       │
-                             paid ◄────────────────────┘
-                          [TERMINAL]
 
-       open ──(manual void)──────────────────────► void
-                                                [TERMINAL]
-
-       open ──(payment exhausted / manual mark)──► uncollectible
-                                                      [TERMINAL]
-```
+My actual handlers create invoices directly in `open`. I considered adding a `draft` state for invoices not yet sent to the customer, but it adds a transition and a guard without being required by the spec. I left it out of the code and the diagram. The table below includes it as a documented extension for completeness.
 
 **All valid transitions:**
+
 | From | To | Trigger |
 |------|----|---------|
-| `draft` | `open` | Invoice created (we create as `open` directly) |
-| `open` | `paid` | `POST /pay` — PSP returns `succeeded` |
+| `draft` | `open` | Invoice finalized or sent to customer |
+| `draft` | `void` | Invoice voided before sending |
+| `open` | `paid` | `POST /invoices/:id/pay` succeeds |
 | `open` | `void` | `POST /invoices/:id/void` |
-| `open` | `uncollectible` | Future: after N failed payment attempts |
-| `draft` | `void` | Manual void before sending |
+| `open` | `uncollectible` | Manual mark after repeated failed attempts |
 
-**Terminal states:** `paid`, `void`, `uncollectible` — no transitions out.
+**Terminal states:** `paid`, `void`, `uncollectible`.
 
-**Invalid transitions rejected:** Any call to `POST /pay` on a non-`open` invoice returns `409 Conflict` with `{"error": {"code": "invalid_state_transition", "current": "paid", "attempted": "pay"}}`. The check happens **before** any DB write or PSP call.
+Nothing transitions out of these. Once an invoice reaches a terminal state, the system does not move it anywhere else. If a paid invoice needs to be undone, that is a refund modeled as a separate action, not a reverse transition back to `open`.
 
-**Reversible transitions:** None. All transitions are one-way. This is intentional — payment state must be an append-only audit trail.
+**Reversible transitions:** None. All transitions are one-way by design.
 
----
+**Invalid transitions at the API level:**
+
+Any `POST /pay` on a non-`open` invoice returns `409 Conflict` before any PSP call or payment attempt insert:
+
+```json
+{
+  "error": {
+    "code": "invalid_state_transition",
+    "current": "paid",
+    "attempted": "pay"
+  }
+}
+```
+
+***
 
 ## 3. Payment Correctness & Failure Modes
 
-### (a) Two concurrent POST /pay for the same invoice
+This was the hardest part of the assignment. The happy path is straightforward. The real work is in what happens when requests race, the PSP is slow, or the process dies at the wrong time.
 
-**What happens:** Both requests hit the handler simultaneously.
+### (a) Two clients POST /pay for the same invoice simultaneously
 
-**Mechanism:** `SELECT ... FOR UPDATE` on the invoice row inside a transaction. The first request acquires the row lock and proceeds. The second request blocks at the `SELECT FOR UPDATE` until the first transaction commits. At that point, the invoice status is `paid`, so the second request reads `paid`, hits the state machine guard, and returns `409 Conflict`.
+Both requests hit the handler at almost the same time.
 
-**Why `SELECT FOR UPDATE` over alternatives:**
-- *Optimistic concurrency (version column)*: Would cause noisy retries under high contention. For invoice payments, contention is high and expected — one invoice, multiple retry attempts. OCC is better suited for low-contention updates.
-- *Advisory locks*: Session-scoped, don't compose safely with connection pools (Tokio + sqlx reuse connections). Can leak if the app crashes mid-lock.
-- *Serializable isolation*: Correct but serialization failures require application-level retry logic. `SELECT FOR UPDATE` is simpler and equally correct for this access pattern.
+**Mechanism:** `SELECT ... FOR UPDATE` on the invoice row inside a transaction.
 
-**Outcome:** Exactly one payment succeeds. The invoice transitions to `paid`. All concurrent attempts that lose the race return `409`.
+The first request acquires the row lock and proceeds through the PSP call and status update. The second request blocks on the same row. Once the first transaction commits, the second request reads `status = "paid"`, hits the state machine guard, and returns `409 Conflict`.
 
-### (b) PSP timeout (tok_timeout — 30 seconds)
+**Why this over the alternatives:**
 
-**What happens:**
-1. Payment attempt is inserted as `pending` and committed **before** the PSP call.
-2. We call the PSP with a `tokio::time::timeout` of **10 seconds**.
-3. The PSP does not respond in 10 seconds → timeout fires.
-4. We update the payment attempt to `failed` with `failure_code = "psp_timeout"`.
-5. The invoice status remains `open` — it is not corrupted.
-6. The endpoint returns `200` with the failed attempt details (or `504` depending on preference — we return `200` with the attempt so the caller can inspect `status: "failed"`).
+- *Optimistic concurrency* works well for low-contention updates. Payments on the same invoice are not low contention. You would get a lot of spurious retries under load.
+- *Advisory locks* are session-scoped and interact awkwardly with connection pools. If the app crashes mid-lock, cleanup depends on the session being cleaned up, which is not guaranteed.
+- *Serializable isolation* would also be correct, but it requires the application to handle serialization failures with retry logic. That felt heavier than necessary for this access pattern.
 
-**How the caller finds out:** They receive the `PaymentAttempt` with `status: "failed"` and `failure_code: "psp_timeout"`. They can retry with a new `Idempotency-Key`. The invoice is still `open` and payable.
+**Outcome:** At most one payment succeeds. The others lose the race cleanly with a `409`.
 
-**Why invoice stays open:** The PSP timeout means we do not know whether the charge went through. Marking the invoice `paid` would be incorrect. Marking it `open` is conservative — the customer may not have been charged, and the merchant can retry.
+### (b) PSP timeout (`tok_timeout`, 30 seconds)
 
-### (c) PSP succeeds but service crashes before persisting
+The service uses a 10 second timeout on the PSP call.
 
-**Scenario:** PSP returns `succeeded`. Before we write the `UPDATE invoices SET status = 'paid'`, the process crashes.
+What happens step by step:
 
-**What happens on retry:**
-- The caller retries with the **same `Idempotency-Key`**.
-- We look up the idempotency key and find the existing `payment_attempt` with `status = "pending"` (we committed the pending attempt before calling the PSP).
-- We detect `status = "pending"` — this means a previous call started but did not complete.
-- We re-call the PSP with the same `card_token`. Since the mock PSP is deterministic per token (`tok_success` always succeeds), it returns `succeeded` again with a new `psp_ref`.
-- We update the attempt to `succeeded` and the invoice to `paid`.
+1. Insert a `payment_attempt` row with `status = "pending"` and commit it before calling the PSP.
+2. Call the PSP wrapped in a 10 second timeout.
+3. Timeout fires.
+4. Update the attempt to `status = "failed"`, `failure_code = "psp_timeout"`.
+5. Invoice stays in `open`.
 
-**Does the customer get charged twice?** In a real PSP integration, we would pass the `idempotency_key` to the PSP's charge API. PSPs like Stripe deduplicate on their side using this key. The mock PSP in this project doesn't implement PSP-level idempotency, but the design documents the requirement: **always forward the `Idempotency-Key` to the PSP**.
+The caller gets back a failed attempt and can retry with a new `Idempotency-Key`.
+
+I kept the invoice `open` because a timeout means the system does not know what happened, not that the payment definitely failed. Marking it `uncollectible` after one timeout would be too aggressive.
+
+### (b2) PSP network error (`tok_network_error`)
+
+The mock PSP returns a 500 or drops the connection entirely.
+
+The HTTP client returns an error before any response body is read. The service catches it, updates the `payment_attempt` to `status = "failed"` and `failure_code = "network_error"`, and leaves the invoice in `open`. The outcome is the same as a timeout: the attempt is on record, the invoice is not corrupted, and the caller can retry with a new `Idempotency-Key`. From the caller's perspective, a dropped connection and a timeout look identical.
+
+### (c) PSP returns success but the service crashes before persisting
+
+This is the worst failure mode.
+
+The PSP returns success, the service crashes before writing to the database. On retry with the same `Idempotency-Key`, the service finds the `payment_attempt` in `pending` state and re-calls the PSP.
+
+With the mock PSP, `tok_success` always succeeds, so the retry works. In a real system the correct fix is to forward the same `Idempotency-Key` to the PSP's charge API. PSPs like Stripe deduplicate on their side, so a retry with the same key returns the original result without a second charge. The mock does not implement this, but it is the documented requirement for any real integration.
+
+Local idempotency protects the app layer. PSP-side idempotency protects against double charges across crash boundaries.
 
 ### (d) Idempotency key reused with a different request body
 
-**What happens:** We compute `SHA-256(request_body)` and store it as `request_hash` alongside the idempotency key. On reuse, we compare the incoming `request_hash` against the stored one. If they differ, we return `422 Unprocessable Entity` with `{"error": {"code": "idempotency_conflict"}}`.
+Every pay request stores a `request_hash` (SHA-256 of the request body). On reuse, the incoming hash is compared against the stored one. If they differ, the service returns `422 Unprocessable Entity`:
 
-**Why:** The idempotency key is a promise — "this is the same request, return the same result." A different body breaks that promise. Silently processing the new body would be dangerous (e.g., different `card_token`, different amount). Rejecting it forces the caller to either use the original request or use a new key.
+```json
+{"error": {"code": "idempotency_conflict"}}
+```
+
+Reusing a key with a different body is not a retry. It is a contract violation. Silently processing the new body, especially if it has a different `card_token`, would undermine the whole idempotency guarantee.
 
 ### (e) POST /pay on an already-paid invoice
 
-**What happens:** The `SELECT FOR UPDATE` acquires the lock, reads `status = "paid"`, hits the state machine guard (`can_be_paid()` returns `false` for `paid`), and returns `409 Conflict` before any PSP call or DB write is made.
-
-**The PSP is never called.** No payment attempt is recorded (the state check prevents insertion).
+The row lock is acquired, the invoice status is read as `paid`, and the handler returns `409` immediately. The PSP is never called and no new payment attempt is inserted. Inserting a spurious attempt would muddy the audit trail.
 
 ### Concurrency mechanism summary
 
-We use **row-level locking** (`SELECT ... FOR UPDATE`) within a serializable-adjacent transaction. This is the correct choice for invoice payments because:
-1. High contention expected (retries, concurrent clients)
-2. The invariant is simple: "only one winner per invoice per transition"
-3. No retry complexity — losers return immediately with a clear error
+Row-level locking with `SELECT ... FOR UPDATE`. It fits here because:
 
----
+1. The contention pattern is predictable.
+2. The invariant is simple: only one transition to `paid` wins.
+3. Losers get a clear error immediately, no retry logic needed on the caller side.
+
+***
 
 ## 4. Webhook Design
 
 ### Signing Scheme
 
-Every webhook delivery includes:
+Every delivery includes:
+
 - `X-Dodo-Timestamp: <unix_seconds>`
 - `X-Dodo-Signature: t=<timestamp>,v1=<hex_hmac>`
 
-The signature is `HMAC-SHA256(secret, "<timestamp>.<raw_body>")`.
+The signature is `HMAC-SHA256(endpoint_secret, "<timestamp>.<raw_body>")`.
 
-**Replay protection:** Receivers should reject webhooks where `|now - timestamp| > 300` (5 minutes). The timestamp is included in the signed payload, so an attacker cannot reuse a valid signature with a new timestamp.
+Including the timestamp in the signed payload means an attacker cannot replay a captured signature. The timestamp would be stale and a correctly implemented receiver would reject it.
 
-**Verification (receiver side):**
-```
-expected = HMAC-SHA256(endpoint_secret, f"{timestamp}.{body}")
-actual   = signature from X-Dodo-Signature header (v1= part)
+**Replay protection:**
+
+Receivers should reject deliveries where `|now - timestamp| > 300` seconds. This is a receiver-side responsibility. I document it as part of the contract rather than enforcing it server-side, because the server has no way to know whether a delivery is a replay from the receiver's perspective.
+
+**Receiver verification:**
+
+```text
+expected = HMAC-SHA256(endpoint_secret, "{timestamp}.{body}")
+actual   = v1 value from X-Dodo-Signature
 valid    = hmac.compare_digest(expected, actual) AND abs(now - timestamp) < 300
 ```
+
+I used a Stripe-style signing format because it is widely understood and straightforward to implement on the receiver side.
 
 ### Retry Policy
 
@@ -222,59 +256,78 @@ valid    = hmac.compare_digest(expected, actual) AND abs(now - timestamp) < 300
 | 3 | 30 seconds |
 | 4 | 2 minutes |
 | 5 | 10 minutes |
+| 6 | 1 hour |
 
-After 5 failed attempts (~12 min 40 sec total budget), the delivery is marked permanently `failed`.
+Total retry window is a little over 1 hour across 6 attempts. After the 6th failure the delivery is marked `failed` and no further retries happen.
+
+One implementation note: I kept webhook delivery as DB-backed polling because it was the simplest thing that survives restarts and fit the time available. I originally had an `updated_at` column write in the delivery update query, then caught that the table did not have that column and removed it.
 
 ### After Exhaustion
 
-Exhausted deliveries are stored in `webhook_deliveries` with `status = 'failed'`. Businesses can:
-1. Call `GET /webhook-deliveries?status=failed` to list all failed deliveries with their payloads.
-2. Re-register a working endpoint and use the payload data to reconcile missed events.
-3. In a production system, we would expose a "replay delivery" endpoint — noted as a future addition.
+Failed deliveries stay in `webhook_deliveries` with the full payload and error context intact. A business can query `GET /webhook-deliveries?status=failed` to see every delivery that did not make it through. To reconcile, they can compare that log against their own event records to identify which invoice state changes they missed, then use the payload stored on each delivery to replay the event on their side. A `POST /webhook-deliveries/:id/replay` endpoint would be the obvious next addition to make this self-service.
 
-### Decoupling from API Response
+### Decoupling from the API Response
 
-Webhook enqueuing is done via `tokio::spawn` immediately after the transaction commits. The API response is returned before any webhook HTTP call is made. The delivery worker is a separate background loop polling `webhook_deliveries` every 5 seconds. This means:
-- A slow or down receiver never slows the API.
-- Webhook delivery failures never affect the payment response.
-- Deliveries are durable — stored in PostgreSQL and retried across restarts.
+Webhook enqueuing happens via `tokio::spawn` right after the payment transaction commits. The API response goes back to the caller before any outbound HTTP is attempted. The delivery worker is a background loop polling the database every 5 seconds.
 
----
+This means a slow or down receiver never affects API latency, and a delivery failure never changes the payment response the caller sees. Because deliveries are written to Postgres before anything else happens, they also survive process restarts.
+
+***
 
 ## 5. API Key Model
 
 | Concern | Decision |
 |---------|----------|
-| **Generation** | `rand::random::<[u8; 32]>()` → hex → prefix with `dodo_` → 69-char key |
-| **Storage** | Only `SHA-256(raw_key)` stored. Plaintext never persists. |
-| **Display** | First 9 chars (`key_prefix`, e.g. `dodo_ab12`) stored for identification without exposing the secret |
-| **Transmission** | `Authorization: Bearer <key>` over HTTPS only |
-| **Rotation** | Create a new key (`POST /admin/businesses`), then revoke the old one (`PATCH /api-keys/:id/revoke`) |
-| **Revocation** | Set `revoked_at = NOW()`. Auth middleware checks `revoked_at IS NULL`. Takes effect immediately on next request. |
-| **Blast radius** | A leaked key gives full business-scoped access. It cannot access other businesses' data (all queries are scoped to `business_id`). Mitigation: immediate revocation + new key. |
+| **Generation** | 32 random bytes via `rand`, hex-encoded, prefixed with `dodo_` |
+| **Storage** | Only `SHA-256(raw_key)` stored. Plaintext never persists after the creation response. |
+| **Display** | Short prefix (`dodo_ab12`) stored for identification without exposing the secret |
+| **Transmission** | `Authorization: Bearer <key>` over HTTPS |
+| **Rotation** | Create a new key, update integrations, then revoke the old one |
+| **Revocation** | `revoked_at = NOW()`. Auth middleware checks `revoked_at IS NULL`. Takes effect immediately on the next request. |
+| **Blast radius** | A leaked key exposes one business. All queries are scoped to `business_id`, so other businesses are not affected. |
 
-**Why SHA-256 (not bcrypt)?** API keys are long, high-entropy random strings — they don't benefit from the slow-hashing protection bcrypt provides (which is designed for low-entropy human passwords). SHA-256 is fast, correct, and avoids unnecessary latency on every authenticated request.
+**Why SHA-256 and not bcrypt?**
 
----
+bcrypt is designed for low-entropy secrets like human passwords. These keys are 32 random bytes, roughly 256 bits of entropy. Brute forcing that is not a realistic attack regardless of hash speed. Using bcrypt here would add 100-300ms of unnecessary latency to every authenticated request. SHA-256 is the right choice for high-entropy secrets.
 
-## 6. What We Cut and Why
+***
 
-1. **Refunds** — Requires a `refunded` terminal state, PSP reversal API, and partial refund accounting. Complexity is disproportionate to the scope. Would add: `POST /invoices/:id/refund`, new `payment_attempts.type` column (`charge` | `refund`), and a `refunded_cents` field on the invoice.
+## 6. What I Cut and Why
 
-2. **Rate limiting** — Would add per-API-key token bucket (Redis `INCR` + TTL or the `governor` crate). Left out because the assignment explicitly lists it as out of scope. Would sit as an Axum middleware layer before the auth middleware.
+**Refunds**
 
-3. **Subscriptions / recurring billing** — Entirely separate domain model (plans, intervals, proration, dunning). Out of scope per assignment.
+Refunds require a new terminal state, a PSP reversal call, and careful accounting around partial vs full amounts. If I were adding this: `POST /invoices/:id/refund` with an optional `amount_cents` field, a `type` column on `payment_attempts` to distinguish charges from refunds, and a `refunded` terminal state. The complexity is real and it is out of scope for this assignment.
 
-4. **Email notifications** — Logging `[WOULD SEND EMAIL to customer@example.com: Invoice #xyz paid]` instead of actually sending. Would use a transactional email provider (Postmark, Resend) in production.
+**Rate limiting**
 
-5. **Audit log** — Every state change should be event-sourced to an `invoice_events` table in production (immutable append-only record of who changed what and when). Skipped for time but is the first thing I would add.
+The assignment listed this as explicitly out of scope. In production this would be a token-bucket middleware layer keyed by `business_id`, backed by Redis for cross-instance enforcement. Without it, a compromised key can exhaust the DB connection pool or hit PSP rate limits.
 
----
+**Subscriptions and recurring billing**
+
+This is a different system entirely, not just another endpoint. It needs plans, billing intervals, proration logic, dunning, and scheduled jobs. Adding it here would have been fake complexity without addressing what the assignment was actually testing.
+
+**Email notifications**
+
+I log a "would send email" message instead of wiring in a real provider. The integration would add setup ceremony without changing anything about the payment correctness questions being evaluated.
+
+**Audit log**
+
+This is probably the biggest thing I deliberately left out. In production I would want an append-only `invoice_events` table recording every state transition, the actor, and the timestamp. Without it, debugging a disputed payment or a compliance review is much harder than it needs to be.
+
+***
 
 ## 7. Production Readiness Gap
 
-1. **Observability** — No metrics (Prometheus counters for `payment.attempted`, `payment.succeeded`, `webhook.delivered`), no distributed tracing (OpenTelemetry spans), no structured log correlation IDs. In production, you cannot debug payment failures without this.
+If this shipped tomorrow, these are the three things I would be most worried about.
 
-2. **Rate limiting** — The API has no per-key request throttling. A misbehaving or compromised client could exhaust DB connections or PSP quotas. Would implement token-bucket rate limiting per `business_id` using Redis.
+**1. Observability**
 
-3. **Idempotency TTL / cleanup** — `payment_attempts` and `webhook_deliveries` grow forever. In production, rows older than 90 days should be archived to cold storage and deleted from the hot table. A background job or pg_partman partition rotation would handle this.
+There are structured logs but no metrics, no distributed tracing, and no correlation IDs on requests. Debugging a payment failure in production without those means grepping logs and hoping the relevant lines are there. I would add Prometheus counters for payment outcomes and PSP errors, OpenTelemetry spans across the request path, and a request ID in every log line.
+
+**2. Rate limiting**
+
+Nothing currently stops a bad client, or a leaked API key, from hammering the service. Per-key token bucket limiting in middleware would protect both the database and the PSP dependency from being exhausted by a single misbehaving caller.
+
+**3. Data retention**
+
+`payment_attempts` and `webhook_deliveries` grow indefinitely. That is fine for an assignment but not for a real service. At any real volume, query performance degrades and storage costs climb within months. A background archival job or time-based partitioning with `pg_partman` would handle this before it becomes a problem.

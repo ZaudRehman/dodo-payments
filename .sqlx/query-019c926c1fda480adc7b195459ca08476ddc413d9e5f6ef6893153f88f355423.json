@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO invoices (business_id, customer_id, status, total_cents, due_date)\n             VALUES ($1, $2, 'open', 5000, CURRENT_DATE + 30) RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "019c926c1fda480adc7b195459ca08476ddc413d9e5f6ef6893153f88f355423"
+}

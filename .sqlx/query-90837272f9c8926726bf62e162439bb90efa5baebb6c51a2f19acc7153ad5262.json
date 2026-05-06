@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE payment_attempts\n             SET status = 'failed', failure_code = 'psp_timeout', updated_at = NOW()\n             WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "90837272f9c8926726bf62e162439bb90efa5baebb6c51a2f19acc7153ad5262"
+}

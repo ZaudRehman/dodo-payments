@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO payment_attempts\n                 (invoice_id, idempotency_key, request_hash, card_token, status)\n             VALUES ($1, $2, $3, 'tok_success', 'succeeded')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "adc6e3a0dfce94b867abc9908aec243b936f8de21abd1de9af9e1d3cc4b02a69"
+}
